@@ -81,8 +81,8 @@ enum ValidationError: Error, LocalizedError {
 }
 
 func validateCoordinates(latitudeText: String, longitudeText: String) throws -> (Double?, Double?) {
-    let trimmedLat = latitudeText.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
-    let trimmedLon = longitudeText.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+    let trimmedLat = latitudeText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedLon = longitudeText.trimmingCharacters(in: .whitespacesAndNewlines)
 
     let latitude = trimmedLat.isEmpty ? nil : Double(trimmedLat)
     let longitude = trimmedLon.isEmpty ? nil : Double(trimmedLon)

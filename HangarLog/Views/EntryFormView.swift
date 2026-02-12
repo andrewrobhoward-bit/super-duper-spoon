@@ -1,20 +1,18 @@
 import SwiftUI
 import SwiftData
 import PhotosUI
-import Combine
 
 struct EntryFormView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
+    @Query(sort: \Entry.dateTime, order: .reverse) private var entries: [Entry]
 
     @StateObject private var locationFetcher = LocationFetcher()
 
     private let editingEntry: Entry?
-    private let registrationSubject = PassthroughSubject<String, Never>()
 
     @State private var mode: EntryMode
     @State private var registration: String
-    @State private var debouncedRegistration: String
     @State private var aircraftType: String
     @State private var operatorName: String
     @State private var dateTime: Date
@@ -31,14 +29,11 @@ struct EntryFormView: View {
 
     @State private var showDuplicateAlert = false
     @State private var validationMessage: String?
-    @State private var saveErrorMessage: String?
-    @State private var insight: RegistrationInsight = .empty
 
     init(mode: EntryMode, editingEntry: Entry? = nil) {
         self.editingEntry = editingEntry
         _mode = State(initialValue: editingEntry?.mode ?? mode)
         _registration = State(initialValue: editingEntry?.registration ?? "")
-        _debouncedRegistration = State(initialValue: normalizeRegistration(editingEntry?.registration ?? ""))
         _aircraftType = State(initialValue: editingEntry?.aircraftType ?? "")
         _operatorName = State(initialValue: editingEntry?.operator ?? "")
         _dateTime = State(initialValue: editingEntry?.dateTime ?? .now)
@@ -56,8 +51,8 @@ struct EntryFormView: View {
         normalizeRegistration(registration)
     }
 
-    private var shouldShowInsight: Bool {
-        debouncedRegistration.count >= 4
+    private var insight: RegistrationInsight {
+        registrationInsight(for: trimmedRegistration, entries: entries, excluding: editingEntry?.id)
     }
 
     var body: some View {
@@ -68,12 +63,11 @@ struct EntryFormView: View {
                         Text(option.title).tag(option)
                     }
                 }
-                .disabled(editingEntry != nil)
 
                 TextField("Registration *", text: $registration)
                     .textInputAutocapitalization(.characters)
 
-                if shouldShowInsight {
+                if !trimmedRegistration.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Seen before: \(insight.count) times")
                             .font(.subheadline)
@@ -160,18 +154,6 @@ struct EntryFormView: View {
                 .disabled(trimmedRegistration.isEmpty)
             }
         }
-        .onAppear {
-            registrationSubject.send(registration)
-        }
-        .onChange(of: registration) { _, newValue in
-            registrationSubject.send(newValue)
-        }
-        .onReceive(registrationSubject.debounce(for: .milliseconds(300), scheduler: RunLoop.main)) { debounced in
-            debouncedRegistration = normalizeRegistration(debounced)
-            Task {
-                await refreshInsight()
-            }
-        }
         .onChange(of: locationFetcher.lastCoordinate) { _, newValue in
             if let coordinate = newValue {
                 latitudeText = String(format: "%.6f", coordinate.latitude)
@@ -192,7 +174,7 @@ struct EntryFormView: View {
         .alert("Possible duplicate", isPresented: $showDuplicateAlert) {
             Button("Save Anyway", role: .destructive) {
                 Task {
-                    await saveEntry()
+                    await saveEntry(ignoreDuplicateCheck: true)
                 }
             }
             Button("Cancel", role: .cancel) {}
@@ -208,15 +190,6 @@ struct EntryFormView: View {
         } message: {
             Text(validationMessage ?? "")
         }
-        .alert("Save Failed", isPresented: Binding(get: {
-            saveErrorMessage != nil
-        }, set: { newValue in
-            if !newValue { saveErrorMessage = nil }
-        })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(saveErrorMessage ?? "")
-        }
     }
 
     private func previewImage(_ image: UIImage) -> some View {
@@ -227,43 +200,45 @@ struct EntryFormView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    @MainActor
-    private func refreshInsight() async {
-        guard shouldShowInsight else {
-            insight = .empty
-            return
-        }
+    private func attemptSave() async {
+        let duplicate = hasPotentialDuplicate(
+            registration: trimmedRegistration,
+            dateTime: dateTime,
+            locationName: locationName,
+            entries: entries,
+            excluding: editingEntry?.id
+        )
 
-        do {
-            insight = try fetchInsight(registration: debouncedRegistration)
-        } catch {
-            insight = .empty
+        if duplicate {
+            showDuplicateAlert = true
+        } else {
+            await saveEntry(ignoreDuplicateCheck: false)
         }
     }
 
-    @MainActor
-    private func attemptSave() async {
+    private func saveEntry(ignoreDuplicateCheck: Bool) async {
+        if !ignoreDuplicateCheck {
+            let duplicate = hasPotentialDuplicate(
+                registration: trimmedRegistration,
+                dateTime: dateTime,
+                locationName: locationName,
+                entries: entries,
+                excluding: editingEntry?.id
+            )
+            if duplicate {
+                showDuplicateAlert = true
+                return
+            }
+        }
+
         guard !trimmedRegistration.isEmpty else {
             validationMessage = ValidationError.invalidRegistration.localizedDescription
             return
         }
 
         do {
-            if try hasDuplicateForSave() {
-                showDuplicateAlert = true
-                return
-            }
-            await saveEntry()
-        } catch {
-            saveErrorMessage = error.localizedDescription
-        }
-    }
-
-    @MainActor
-    private func saveEntry() async {
-        do {
             let (lat, lon) = try validateCoordinates(latitudeText: latitudeText, longitudeText: longitudeText)
-            let firstForReg = try fetchInsight(registration: trimmedRegistration).count == 0
+            let firstForReg = registrationInsight(for: trimmedRegistration, entries: entries, excluding: editingEntry?.id).count == 0
 
             var newPhotoFilenames: [String] = []
             for data in pendingPhotoData {
@@ -295,71 +270,8 @@ struct EntryFormView: View {
 
             try modelContext.save()
             dismiss()
-        } catch let error as ValidationError {
-            validationMessage = error.localizedDescription
         } catch {
-            saveErrorMessage = error.localizedDescription
+            validationMessage = error.localizedDescription
         }
-    }
-
-    private func fetchInsight(registration: String) throws -> RegistrationInsight {
-        let normalized = normalizeRegistration(registration)
-        guard !normalized.isEmpty else { return .empty }
-
-        let descriptor: FetchDescriptor<Entry>
-        if let editingID = editingEntry?.id {
-            descriptor = FetchDescriptor<Entry>(
-                predicate: #Predicate<Entry> { entry in
-                    entry.registration == normalized && entry.id != editingID
-                },
-                sortBy: [SortDescriptor(\Entry.dateTime, order: .reverse)]
-            )
-        } else {
-            descriptor = FetchDescriptor<Entry>(
-                predicate: #Predicate<Entry> { entry in
-                    entry.registration == normalized
-                },
-                sortBy: [SortDescriptor(\Entry.dateTime, order: .reverse)]
-            )
-        }
-
-        let matches = try modelContext.fetch(descriptor)
-        return RegistrationInsight(
-            count: matches.count,
-            lastSeenDate: matches.first?.dateTime,
-            lastSeenLocation: matches.first?.locationName.isEmpty == true ? nil : matches.first?.locationName
-        )
-    }
-
-    private func hasDuplicateForSave() throws -> Bool {
-        let normalizedLocation = locationName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedRegistration.isEmpty, !normalizedLocation.isEmpty else { return false }
-
-        let start = dateTime.addingTimeInterval(-2 * 60 * 60)
-        let end = dateTime.addingTimeInterval(2 * 60 * 60)
-
-        let descriptor: FetchDescriptor<Entry>
-        if let editingID = editingEntry?.id {
-            descriptor = FetchDescriptor<Entry>(
-                predicate: #Predicate<Entry> { entry in
-                    entry.registration == trimmedRegistration &&
-                    entry.locationName == normalizedLocation &&
-                    entry.dateTime >= start &&
-                    entry.dateTime <= end &&
-                    entry.id != editingID
-                }
-            )
-        } else {
-            descriptor = FetchDescriptor<Entry>(
-                predicate: #Predicate<Entry> { entry in
-                    entry.registration == trimmedRegistration &&
-                    entry.locationName == normalizedLocation &&
-                    entry.dateTime >= start &&
-                    entry.dateTime <= end
-                }
-            )
-        }
-
-        return try !modelContext.fetch(descriptor).isEmpty
     }
 }
